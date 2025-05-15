@@ -781,12 +781,13 @@ def extract_liquidating_trustee_from_plan_supplement(df):
     fingerprint_dir = os.path.join(os.path.dirname(rag.vector_store_dir), "fingerprints")
     os.makedirs(fingerprint_dir, exist_ok=True)
     
-    # Filter for Plan Supplement documents
-    plan_supplement_df = df[df['recapdocument_description'].str.contains('Plan Supplement', na=False)]
-    print(f"Found {len(plan_supplement_df)} plan supplement documents to process")
+    # STAGE 1: First filter Plan Supplement documents from recapdocument_description
+    recap_plan_supplement_df = df[df['recapdocument_description'].str.contains('Plan Supplement', case=False, na=False)]
+    print(f"Found {len(recap_plan_supplement_df)} plan supplement documents in recapdocument_description to process")
 
-    for idx, row in plan_supplement_df.iterrows():
-        print(f"\n--- Processing document {idx+1}/{len(plan_supplement_df)} ---")
+    # Process all recapdocument_description matches first
+    for idx, row in recap_plan_supplement_df.iterrows():
+        print(f"\n--- Processing recapdocument_description document {idx+1}/{len(recap_plan_supplement_df)} ---")
         
         # Get cleaned URL from either column
         pdf_url = clean_pdf_url(row)
@@ -799,44 +800,10 @@ def extract_liquidating_trustee_from_plan_supplement(df):
         tmp_path = None
         
         try:
-            # Download PDF
-            print(f"⬇️ Downloading PDF from: {pdf_url}")
-            response = requests.get(pdf_url)
-            response.raise_for_status()
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-                tmp.write(response.content)
-                tmp_path = tmp.name
-                print(f"💾 Saved temp PDF: {tmp_path}")
-
-            # Process with RAG
-            print("🔧 Ingesting PDF into RAG...")
-            rag.ingest(tmp_path, fingerprint_dir=fingerprint_dir)
-            
-            # First try to extract the Liquidating Trustee
-            print("❓ Querying RAG: 'Who is appointed as the Liquidating Trustee?'")
-            answer = rag.ask("Who is appointed as the Liquidating Trustee? Who will serve as the Liquidating Trustee?")
-            print(f"📄 RAW RAG ANSWER: {answer}")
-            
-            trustee_name = extract_liquidating_trustee_with_gpt(str(answer))
-            print(f"👤 EXTRACTED LIQUIDATING TRUSTEE: {trustee_name}")
-            
-            # Check if we got a valid name (not "No liquidating trustee found" or similar)
-            if trustee_name and not any(x in trustee_name.lower() for x in ['no', 'not found', 'none', 'unable']):
-                print(f"✅ VALID LIQUIDATING TRUSTEE FOUND: {trustee_name}")
-                liquidating_trustee = trustee_name
-            else:
-                # If no Liquidating Trustee, try for Plan Administrator
-                print("❓ Querying RAG: 'Who is the Plan Administrator acting on behalf of a Liquidating Trustee?'")
-                answer = rag.ask("Who is the Plan Administrator? Is there a Plan Administrator acting on behalf of a Liquidating Trustee?")
-                print(f"📄 RAW RAG ANSWER: {answer}")
-                
-                admin_name = extract_plan_administrator_with_gpt(str(answer))
-                print(f"👤 EXTRACTED PLAN ADMINISTRATOR: {admin_name}")
-                
-                if admin_name and not any(x in admin_name.lower() for x in ['no', 'not found', 'none', 'unable']):
-                    print(f"✅ PLAN ADMINISTRATOR FOUND AS FALLBACK: {admin_name}")
-                    liquidating_trustee = admin_name
+            # Process the PDF - pass current value and get updated value back
+            tmp_path, liquidating_trustee = process_pdf_and_extract_trustee(
+                pdf_url, rag, fingerprint_dir, liquidating_trustee
+            )
             
             # If trustee found, we can stop processing
             if liquidating_trustee:
@@ -855,6 +822,53 @@ def extract_liquidating_trustee_from_plan_supplement(df):
                     os.unlink(tmp_path)
                 except Exception as e:
                     print(f"⚠️ Failed to delete temp file: {str(e)}")
+    
+    # STAGE 2: If no trustee found, check docketentry_description next
+    if not liquidating_trustee:
+        # Filter Plan Supplement documents from docketentry_description (excluding ones already processed)
+        docket_plan_supplement_df = df[
+            (df['docketentry_description'].str.contains('Plan Supplement', case=False, na=False)) & 
+            (~df.index.isin(recap_plan_supplement_df.index))  # Exclude already processed rows
+        ]
+        print(f"Found {len(docket_plan_supplement_df)} additional plan supplement documents in docketentry_description to process")
+        
+        # Process all docketentry_description matches
+        for idx, row in docket_plan_supplement_df.iterrows():
+            print(f"\n--- Processing docketentry_description document {idx+1}/{len(docket_plan_supplement_df)} ---")
+            
+            # Get cleaned URL from either column
+            pdf_url = clean_pdf_url(row)
+            
+            if not pdf_url:
+                print("No valid PDF URL found in either column")
+                continue
+                
+            print(f"Final PDF URL: {pdf_url}")
+            tmp_path = None
+            
+            try:
+                # Process the PDF - pass current value and get updated value back
+                tmp_path, liquidating_trustee = process_pdf_and_extract_trustee(
+                    pdf_url, rag, fingerprint_dir, liquidating_trustee
+                )
+                
+                # If trustee found, we can stop processing
+                if liquidating_trustee:
+                    print("✅ Liquidating Trustee or Plan Administrator found, stopping PDF processing")
+                    break
+
+            except Exception as e:
+                print(f"❌ PROCESSING ERROR: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    print(f"🧹 Cleaning up temp file: {tmp_path}")
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception as e:
+                        print(f"⚠️ Failed to delete temp file: {str(e)}")
                 
     print("\n=== PROCESSING COMPLETE ===")
     
@@ -863,6 +877,57 @@ def extract_liquidating_trustee_from_plan_supplement(df):
     rag.cleanup_old_vector_stores(base_vector_dir, max_stores=5)
     
     return liquidating_trustee
+
+# Helper function to extract the PDF processing code (to avoid repetition)
+def process_pdf_and_extract_trustee(pdf_url, rag, fingerprint_dir, current_trustee):
+    """Process a single PDF to extract liquidating trustee or plan administrator"""
+    # Use passed-in value instead of global
+    liquidating_trustee = current_trustee
+    
+    tmp_path = None
+    
+    # Download PDF once
+    print(f"⬇️ Downloading PDF from: {pdf_url}")
+    response = requests.get(pdf_url)
+    response.raise_for_status()
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        tmp.write(response.content)
+        tmp_path = tmp.name
+        print(f"💾 Saved temp PDF: {tmp_path}")
+
+    # Process with RAG (with fingerprinting) only once
+    print("🔧 Ingesting PDF into RAG...")
+    rag.ingest(tmp_path, fingerprint_dir=fingerprint_dir)
+    
+    # Try to extract the Liquidating Trustee if not found yet
+    if not liquidating_trustee:
+        print("❓ Querying RAG: 'Who is appointed as the Liquidating Trustee?'")
+        answer = rag.ask("Who is appointed as the Liquidating Trustee? Who will serve as the Liquidating Trustee?")
+        print(f"📄 RAW RAG ANSWER: {answer}")
+        
+        trustee_name = extract_liquidating_trustee_with_gpt(str(answer))
+        print(f"👤 EXTRACTED LIQUIDATING TRUSTEE: {trustee_name}")
+        
+        # Check if we got a valid name (not "No liquidating trustee found" or similar)
+        if trustee_name and not any(x in trustee_name.lower() for x in ['no', 'not found', 'none', 'unable']):
+            print(f"✅ VALID LIQUIDATING TRUSTEE FOUND: {trustee_name}")
+            liquidating_trustee = trustee_name
+        else:
+            # If no Liquidating Trustee, try for Plan Administrator
+            print("❓ Querying RAG: 'Who is the Plan Administrator acting on behalf of a Liquidating Trustee?'")
+            answer = rag.ask("Who is the Plan Administrator? Is there a Plan Administrator acting on behalf of a Liquidating Trustee?")
+            print(f"📄 RAW RAG ANSWER: {answer}")
+            
+            admin_name = extract_plan_administrator_with_gpt(str(answer))
+            print(f"👤 EXTRACTED PLAN ADMINISTRATOR: {admin_name}")
+            
+            if admin_name and not any(x in admin_name.lower() for x in ['no', 'not found', 'none', 'unable']):
+                print(f"✅ PLAN ADMINISTRATOR FOUND AS FALLBACK: {admin_name}")
+                liquidating_trustee = admin_name
+    
+    # Return the tmp_path and the potentially updated trustee variable
+    return tmp_path, liquidating_trustee
 
 def extract_hearing_date_with_gpt(text):
     """Use OpenAI to extract date from text"""
@@ -895,22 +960,70 @@ def extract_voting_deadline_with_gpt(text):
     return response.choices[0].message.content.strip()
 
 def extract_deadlines_from_disclosure_statements(df):
-        """Process Disclosure Statement PDFs once and extract both dates"""
-        print("\n=== STARTING DISCLOSURE STATEMENT PROCESSING FOR ALL DEADLINES ===")
-        rag = RAGSystem()
-        confirmation_hearing_date = None
-        voting_deadline = None
-        
-        # Define fingerprint directory
-        fingerprint_dir = os.path.join(os.path.dirname(rag.vector_store_dir), "fingerprints")
-        os.makedirs(fingerprint_dir, exist_ok=True)
-        
-        # Filter disclosure statements
-        disclosure_df = df[df['recapdocument_description'].str.contains('Disclosure Statement', na=False)]
-        print(f"Found {len(disclosure_df)} disclosure statements to process")
+    """Process Disclosure Statement PDFs once and extract both dates"""
+    print("\n=== STARTING DISCLOSURE STATEMENT PROCESSING FOR ALL DEADLINES ===")
+    rag = RAGSystem()
+    confirmation_hearing_date = None
+    voting_deadline = None
+    
+    # Define fingerprint directory
+    fingerprint_dir = os.path.join(os.path.dirname(rag.vector_store_dir), "fingerprints")
+    os.makedirs(fingerprint_dir, exist_ok=True)
+    
+    # STAGE 1: First filter disclosure statements from recapdocument_description
+    recap_disclosure_df = df[df['recapdocument_description'].str.contains('Disclosure Statement', case=False, na=False)]
+    print(f"Found {len(recap_disclosure_df)} disclosure statements in recapdocument_description to process")
 
-        for idx, row in disclosure_df.iterrows():
-            print(f"\n--- Processing document {idx+1}/{len(disclosure_df)} ---")
+    # Process all recapdocument_description matches first
+    for idx, row in recap_disclosure_df.iterrows():
+        print(f"\n--- Processing recapdocument_description document {idx+1}/{len(recap_disclosure_df)} ---")
+        
+        # Get cleaned URL from either column
+        pdf_url = clean_pdf_url(row)
+        
+        if not pdf_url:
+            print("No valid PDF URL found in either column")
+            continue
+            
+        print(f"Final PDF URL: {pdf_url}")
+        tmp_path = None
+        
+        try:
+            # Process the PDF - pass current values and get updated values back
+            tmp_path, confirmation_hearing_date, voting_deadline = process_pdf_and_extract_dates(
+                pdf_url, rag, fingerprint_dir, confirmation_hearing_date, voting_deadline
+            )
+            
+            # Break if both dates found
+            if confirmation_hearing_date and voting_deadline:
+                print("✅ Both deadlines found, stopping PDF processing")
+                break
+
+        except Exception as e:
+            print(f"❌ PROCESSING ERROR: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+            
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                print(f"🧹 Cleaning up temp file: {tmp_path}")
+                try:
+                    os.unlink(tmp_path)
+                except Exception as e:
+                    print(f"⚠️ Failed to delete temp file: {str(e)}")
+    
+    # STAGE 2: If not both dates found, check docketentry_description next
+    if not (confirmation_hearing_date and voting_deadline):
+        # Filter disclosure statements from docketentry_description (excluding ones already processed)
+        docket_disclosure_df = df[
+            (df['docketentry_description'].str.contains('Disclosure Statement', case=False, na=False)) & 
+            (~df.index.isin(recap_disclosure_df.index))  # Exclude already processed rows
+        ]
+        print(f"Found {len(docket_disclosure_df)} additional disclosure statements in docketentry_description to process")
+        
+        # Process all docketentry_description matches
+        for idx, row in docket_disclosure_df.iterrows():
+            print(f"\n--- Processing docketentry_description document {idx+1}/{len(docket_disclosure_df)} ---")
             
             # Get cleaned URL from either column
             pdf_url = clean_pdf_url(row)
@@ -923,47 +1036,12 @@ def extract_deadlines_from_disclosure_statements(df):
             tmp_path = None
             
             try:
-                # Download PDF once
-                print(f"⬇️ Downloading PDF from: {pdf_url}")
-                response = requests.get(pdf_url)
-                response.raise_for_status()
+                # Process the PDF - pass current values and get updated values back
+                tmp_path, confirmation_hearing_date, voting_deadline = process_pdf_and_extract_dates(
+                    pdf_url, rag, fingerprint_dir, confirmation_hearing_date, voting_deadline
+                )
                 
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-                    tmp.write(response.content)
-                    tmp_path = tmp.name
-                    print(f"💾 Saved temp PDF: {tmp_path}")
-
-                # Process with RAG (with fingerprinting) only once
-                print("🔧 Ingesting PDF into RAG...")
-                rag.ingest(tmp_path, fingerprint_dir=fingerprint_dir)
-                
-                # Extract confirmation hearing date if not found yet
-                if not confirmation_hearing_date:
-                    print("❓ Querying RAG: 'What is the Confirmation Hearing Date in this PDF?'")
-                    answer = rag.ask("What is the Confirmation Hearing Date in this PDF?")
-                    print(f"📄 RAW RAG ANSWER: {answer}")
-                    
-                    date_str = extract_hearing_date_with_gpt(str(answer))
-                    print(f"📅 EXTRACTED CONFIRMATION DATE: {date_str}")
-                    
-                    if re.match(r'\d{1,2}/\d{1,2}/\d{4}', date_str):
-                        print(f"✅ VALID CONFIRMATION DATE FOUND: {date_str}")
-                        confirmation_hearing_date = date_str
-                
-                # Extract voting deadline if not found yet
-                if not voting_deadline:
-                    print("❓ Querying RAG: 'What is the Voting Deadline in this PDF?'")
-                    answer = rag.ask("What is the Voting Deadline or Ballot Deadline in this PDF? When must votes be submitted by?")
-                    print(f"📄 RAW RAG ANSWER: {answer}")
-                    
-                    date_str = extract_voting_deadline_with_gpt(str(answer))
-                    print(f"📅 EXTRACTED VOTING DEADLINE: {date_str}")
-                    
-                    if re.match(r'\d{1,2}/\d{1,2}/\d{4}', date_str):
-                        print(f"✅ VALID VOTING DEADLINE FOUND: {date_str}")
-                        voting_deadline = date_str
-                
-                # If both dates found, we can stop processing
+                # Break if both dates found
                 if confirmation_hearing_date and voting_deadline:
                     print("✅ Both deadlines found, stopping PDF processing")
                     break
@@ -980,14 +1058,66 @@ def extract_deadlines_from_disclosure_statements(df):
                         os.unlink(tmp_path)
                     except Exception as e:
                         print(f"⚠️ Failed to delete temp file: {str(e)}")
-                    
-        print("\n=== PROCESSING COMPLETE ===")
+                
+    print("\n=== PROCESSING COMPLETE ===")
+    
+    # Clean up old vector stores
+    base_vector_dir = os.path.dirname(rag.vector_store_dir)
+    rag.cleanup_old_vector_stores(base_vector_dir, max_stores=5)
+    
+    return confirmation_hearing_date, voting_deadline
+
+# Helper function to extract the PDF processing code (to avoid repetition)
+def process_pdf_and_extract_dates(pdf_url, rag, fingerprint_dir, current_hearing_date, current_voting_deadline):
+    """Process a single PDF to extract dates"""
+    # Use passed-in values instead of globals
+    confirmation_hearing_date = current_hearing_date
+    voting_deadline = current_voting_deadline
+    
+    tmp_path = None
+    
+    # Download PDF once
+    print(f"⬇️ Downloading PDF from: {pdf_url}")
+    response = requests.get(pdf_url)
+    response.raise_for_status()
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        tmp.write(response.content)
+        tmp_path = tmp.name
+        print(f"💾 Saved temp PDF: {tmp_path}")
+
+    # Process with RAG (with fingerprinting) only once
+    print("🔧 Ingesting PDF into RAG...")
+    rag.ingest(tmp_path, fingerprint_dir=fingerprint_dir)
+    
+    # Extract confirmation hearing date if not found yet
+    if not confirmation_hearing_date:
+        print("❓ Querying RAG: 'What is the Confirmation Hearing Date in this PDF?'")
+        answer = rag.ask("What is the Confirmation Hearing Date in this PDF?")
+        print(f"📄 RAW RAG ANSWER: {answer}")
         
-        # Clean up old vector stores
-        base_vector_dir = os.path.dirname(rag.vector_store_dir)
-        rag.cleanup_old_vector_stores(base_vector_dir, max_stores=5)
+        date_str = extract_hearing_date_with_gpt(str(answer))
+        print(f"📅 EXTRACTED CONFIRMATION DATE: {date_str}")
         
-        return confirmation_hearing_date, voting_deadline
+        if re.match(r'\d{1,2}/\d{1,2}/\d{4}', date_str):
+            print(f"✅ VALID CONFIRMATION DATE FOUND: {date_str}")
+            confirmation_hearing_date = date_str
+    
+    # Extract voting deadline if not found yet
+    if not voting_deadline:
+        print("❓ Querying RAG: 'What is the Voting Deadline in this PDF?'")
+        answer = rag.ask("What is the Voting Deadline or Ballot Deadline in this PDF? When must votes be submitted by?")
+        print(f"📄 RAW RAG ANSWER: {answer}")
+        
+        date_str = extract_voting_deadline_with_gpt(str(answer))
+        print(f"📅 EXTRACTED VOTING DEADLINE: {date_str}")
+        
+        if re.match(r'\d{1,2}/\d{1,2}/\d{4}', date_str):
+            print(f"✅ VALID VOTING DEADLINE FOUND: {date_str}")
+            voting_deadline = date_str
+    
+    # Return the tmp_path and the potentially updated date variables
+    return tmp_path, confirmation_hearing_date, voting_deadline
   
 def extract_case_details(df):
     """Extracts structured details from docket entries."""
@@ -1006,15 +1136,20 @@ def extract_case_details(df):
     if not case_no:
         log("WARNING: No case number extracted!")
 
-    fa_ib = extract_fa_ib_debtor(descriptions)
-    
+    # fa_ib = extract_fa_ib_debtor(descriptions)
+    fa_ib = "TBD"    
     # Extract DIP1 and DIP2 using new functions
-    dip1 = extract_dip1_with_openai(descriptions)
-    dip2 = extract_dip2_with_openai(descriptions)
+    # dip1 = extract_dip1_with_openai(descriptions)
+    # dip2 = extract_dip2_with_openai(descriptions)
+    dip1 = "TBD"
+    dip2 = "TBD"
+    
 
     # Extract Committee Counsel
     committee_counsel1 = extract_committee_counsel1(descriptions)
     committee_counsel2 = extract_committee_counsel2(descriptions)
+    
+
     # Extract Committee Financial Advisor
     committee_counsel_fa1 = extract_committee_financial_advisor1(descriptions)
     committee_counsel_fa2 = extract_committee_financial_advisor2(descriptions)
@@ -1176,6 +1311,6 @@ def process_folder(folder_path, output_file):
     
 # Main execution
 if __name__ == "__main__":
-    main_folder = r"zLT Predictive Model Inputs\LT"
-    output_file = "NewTrackerSheet0.csv"
+    main_folder = r"Responses"
+    output_file = "NewTrackerSheet.csv"
     process_folder(main_folder, output_file)
